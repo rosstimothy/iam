@@ -28,8 +28,11 @@ func NewUpdateRolesHandler(client *ent.Client) *UpdateRolesHandler {
 	return &UpdateRolesHandler{client: client}
 }
 
+var (
+	notFound *ent.NotFoundError
+)
+
 func (l *UpdateRolesHandler) Handle(ctx context.Context, cmd UpdateRoles) (err error) {
-	fmt.Println("fetching roles")
 	defer func() {
 		if err != nil {
 			fmt.Println("failed to update roles")
@@ -39,6 +42,7 @@ func (l *UpdateRolesHandler) Handle(ctx context.Context, cmd UpdateRoles) (err e
 		fmt.Println("completed updating roles")
 	}()
 
+	fmt.Println("fetching roles")
 	roles, err := fetchRoles(ctx)
 	if err != nil {
 		return err
@@ -54,100 +58,136 @@ func (l *UpdateRolesHandler) Handle(ctx context.Context, cmd UpdateRoles) (err e
 	defer tx.Rollback()
 
 	for _, iamRole := range roles {
-		permissions := make([]*ent.Permission, 0, len(iamRole.IncludedPermissions))
-		perms, err := tx.Permission.
-			Query().
-			Where(permission.NameIn(iamRole.IncludedPermissions...)).
-			All(ctx)
-		if err != nil {
-			return err
-		}
-
-		for _, p := range iamRole.IncludedPermissions {
-			idx := -1
-			for j, pp := range perms {
-				if p == pp.Name {
-					idx = j
-					break
-				}
-			}
-
-			if idx >= 0 {
-				permissions = append(permissions, perms[idx])
-				continue
-			}
-
-			fmt.Printf("creating permission %s\n", p)
-			pp, err := tx.Permission.
-				Create().
-				SetName(p).
-				Save(ctx)
+		if iamRole.Deleted {
+			_, err := tx.Role.Delete().Where(role.Name(iamRole.Name)).Exec(ctx)
 			if err != nil {
-				return err
+				fmt.Println(err.Error())
 			}
-
-			permissions = append(permissions, pp)
+			continue
 		}
 
-		r, err := tx.Role.
-			Query().
-			Where(role.Name(iamRole.Name)).
-			WithPermissions().
-			Only(ctx)
-
-		var notFound *ent.NotFoundError
+		r, err := tx.Role.Query().Where(role.Name(iamRole.Name)).WithPermissions().Only(ctx)
 		if err != nil {
 			if !errors.As(err, &notFound) {
 				return err
 			}
 
 			fmt.Printf("creating role %s\n", iamRole.Name)
-			_, err = tx.Role.Create().
-				SetName(iamRole.Name).
-				SetTitle(iamRole.Title).
-				SetDescription(iamRole.Description).
-				SetEtag(iamRole.Etag).
-				SetStage(int(iamRole.Stage)).
-				AddPermissions(permissions...).
-				Save(ctx)
-			if err != nil {
+			if err := createRole(ctx, tx, iamRole); err != nil {
 				return err
 			}
-
 			continue
 		}
 
-		for _, rp := range r.Edges.Permissions {
-			idx := -1
-			for j, pp := range permissions {
-				if rp.Name == pp.Name {
-					idx = j
-					break
-				}
-			}
-
-			if idx < 0 {
-				continue
-			}
-
-			permissions = append(permissions[:idx], permissions[idx+1:]...)
-		}
-
-		fmt.Printf("updating role %s %v\n", iamRole.Name, len(permissions))
-		_, err = r.Update().
-			SetTitle(iamRole.Title).
-			SetDescription(iamRole.Description).
-			SetEtag(iamRole.Etag).
-			SetStage(int(iamRole.Stage)).
-			AddPermissions(permissions...).
-			Save(ctx)
-		if err != nil {
+		fmt.Printf("updating role %s\n", iamRole.Name)
+		if err := updateRole(ctx, tx, r, iamRole); err != nil {
 			return err
 		}
-
 	}
 
 	return tx.Commit()
+}
+
+func newPermissions(ctx context.Context, tx *ent.Tx, iamRole *adminpb.Role) ([]*ent.Permission, error) {
+	permissions, err := tx.Permission.
+		Query().
+		Where(permission.NameIn(iamRole.IncludedPermissions...)).
+		All(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var newPermissions []*ent.PermissionCreate
+
+	for i, includedPermission := range iamRole.IncludedPermissions {
+		idx := -1
+		for _, existingPermission := range permissions {
+			if existingPermission.Name == includedPermission {
+				idx = i
+				break
+			}
+		}
+
+		if idx < 0 {
+			fmt.Printf("creating permission %s\n", includedPermission)
+			newPermissions = append(newPermissions, tx.Permission.Create().SetName(includedPermission))
+		}
+	}
+
+	if len(newPermissions) > 0 {
+		p, err := tx.Permission.CreateBulk(newPermissions...).Save(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		return append(permissions, p...), nil
+	}
+
+	return permissions, nil
+}
+
+func createRole(ctx context.Context, tx *ent.Tx, iamRole *adminpb.Role) error {
+	perms, err := newPermissions(ctx, tx, iamRole)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.Role.Create().
+		SetName(iamRole.Name).
+		SetTitle(iamRole.Title).
+		SetDescription(iamRole.Description).
+		SetEtag(iamRole.Etag).
+		SetStage(int(iamRole.Stage)).
+		AddPermissions(perms...).
+		Save(ctx)
+
+	return err
+}
+
+func removedPermissions(ctx context.Context, tx *ent.Tx, r *ent.Role, iamRole *adminpb.Role) ([]*ent.Permission, error) {
+
+	var removedPermissions []*ent.Permission
+
+	for i, existingPermission := range r.Edges.Permissions {
+		idx := -1
+		for _, includedPermission := range iamRole.IncludedPermissions {
+			if existingPermission.Name == includedPermission {
+				idx = i
+				break
+			}
+		}
+
+		if idx < 0 {
+			fmt.Printf("removing permission %s\n", existingPermission.Name)
+			removedPermissions = append(removedPermissions, existingPermission)
+		}
+	}
+
+	return removedPermissions, nil
+}
+
+func updateRole(ctx context.Context, tx *ent.Tx, r *ent.Role, iamRole *adminpb.Role) error {
+
+	newPerms, err := newPermissions(ctx, tx, iamRole)
+	if err != nil {
+		return err
+	}
+
+	removedPerms, err := removedPermissions(ctx, tx, r, iamRole)
+	if err != nil {
+		return err
+	}
+
+	_, err = r.Update().
+		SetTitle(iamRole.Title).
+		SetDescription(iamRole.Description).
+		SetEtag(iamRole.Etag).
+		SetStage(int(iamRole.Stage)).
+		RemovePermissions(removedPerms...).
+		AddPermissions(newPerms...).
+		Save(ctx)
+
+	return err
 }
 
 func fetchRoles(ctx context.Context) ([]*adminpb.Role, error) {
@@ -163,7 +203,7 @@ func fetchRoles(ctx context.Context) ([]*adminpb.Role, error) {
 			Parent:      "",
 			PageToken:   token,
 			View:        adminpb.RoleView_FULL,
-			ShowDeleted: false,
+			ShowDeleted: true,
 		})
 		if err != nil {
 			return nil, err
