@@ -13,8 +13,7 @@ import (
 	"github.com/rosstimothy/iam/ent/role"
 )
 
-type UpdateRoles struct {
-}
+type UpdateRoles struct{}
 
 type UpdateRolesHandler struct {
 	client *ent.Client
